@@ -9,15 +9,18 @@ import (
 	mrand "math/rand"
 	"os"
 	"sync"
+	"time"
 
 	ds "github.com/ipfs/go-datastore"
 	dsync "github.com/ipfs/go-datastore/sync"
 	logging "github.com/ipfs/go-log/v2"
+	path "github.com/ipfs/go-path"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/peerstore"
+	"github.com/libp2p/go-libp2p-core/routing"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -75,7 +78,7 @@ func runCmd(c *cli.Context) error {
 		pi, _ := peer.AddrInfoFromP2pAddr(addr)
 		bootstrapPeers = append(bootstrapPeers, *pi)
 	}
-	ha, err := makeRoutedHost(listenF, seed, bootstrapPeers)
+	ha, idht, err := makeRoutedHost(listenF, seed, bootstrapPeers)
 	if err != nil {
 		return err
 	}
@@ -85,17 +88,60 @@ func runCmd(c *cli.Context) error {
 		return err
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
+	ctx, events := routing.RegisterForQueryEvents(ctx)
+
+	//dht := ha.DHT.WAN
+	//if !ha.DHT.WANActive() {
+	//	dht = ha.DHT.LAN
+	//}
+
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(errCh)
+		defer cancel()
+		closestPeers, err := idht.GetClosestPeers(ctx, string(peerid))
+		if closestPeers != nil {
+			for _, p := range closestPeers {
+				routing.PublishQueryEvent(ctx, &routing.QueryEvent{
+					ID:   p,
+					Type: routing.FinalPeer,
+				})
+			}
+		}
+
+		if err != nil {
+			errCh <- err
+			return
+		}
+	}()
+
+	pfm := pfuncMap{
+		routing.FinalPeer: func(obj *routing.QueryEvent, out io.Writer, verbose bool) error {
+			fmt.Fprintf(out, "%s\n", obj.ID)
+			return nil
+		},
+	}
+
+	for e := range events {
+		printEvent(e, os.Stdout, true, pfm)
+	}
+
+	// need a new ctx so that ping actually runs.
+	ctx = context.Background()
+
 	res := ping.Ping(ctx, ha, peerid)
 	select {
 	case out := <-res:
 		log.Infow("ping", "result", out)
 	}
+
 	return err
 }
 
 // makeRoutedHost creates a LibP2P host with a random peer ID listening on the
 // given multiaddress. It will bootstrap using the provided PeerInfo.
-func makeRoutedHost(listenPort int, randseed int64, bootstrapPeers []peer.AddrInfo) (host.Host, error) {
+func makeRoutedHost(listenPort int, randseed int64, bootstrapPeers []peer.AddrInfo) (host.Host, *dht.IpfsDHT, error) {
 	// If the seed is zero, use real cryptographic randomness. Otherwise, use a
 	// deterministic randomness source to make generated keys stay the same
 	// across multiple runs
@@ -110,7 +156,7 @@ func makeRoutedHost(listenPort int, randseed int64, bootstrapPeers []peer.AddrIn
 	// to obtain a valid host ID.
 	priv, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, r)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	opts := []libp2p.Option{
@@ -126,7 +172,7 @@ func makeRoutedHost(listenPort int, randseed int64, bootstrapPeers []peer.AddrIn
 
 	basicHost, err := libp2p.New(ctx, opts...)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Construct a datastore (needed by the DHT). This is just a simple, in-memory thread-safe datastore.
@@ -141,13 +187,13 @@ func makeRoutedHost(listenPort int, randseed int64, bootstrapPeers []peer.AddrIn
 	// connect to the chosen ipfs nodes
 	err = bootstrapConnect(ctx, routedHost, bootstrapPeers)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Bootstrap the host
 	err = idht.Bootstrap(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Build host multiaddress
@@ -161,7 +207,7 @@ func makeRoutedHost(listenPort int, randseed int64, bootstrapPeers []peer.AddrIn
 		log.Infow("ping host addr", "addr", addr.Encapsulate(hostAddr))
 	}
 
-	return routedHost, nil
+	return routedHost, idht, nil
 }
 
 // Borrowed from ipfs code to parse the results of the command `ipfs id`
@@ -219,4 +265,73 @@ func bootstrapConnect(ctx context.Context, ph host.Host, peers []peer.AddrInfo) 
 		return fmt.Errorf("failed to bootstrap. %s", err)
 	}
 	return nil
+}
+
+type printFunc func(obj *routing.QueryEvent, out io.Writer, verbose bool) error
+type pfuncMap map[routing.QueryEventType]printFunc
+
+func printEvent(obj *routing.QueryEvent, out io.Writer, verbose bool, override pfuncMap) error {
+	if verbose {
+		fmt.Fprintf(out, "%s: ", time.Now().Format("15:04:05.000"))
+	}
+
+	if override != nil {
+		if pf, ok := override[obj.Type]; ok {
+			return pf(obj, out, verbose)
+		}
+	}
+
+	switch obj.Type {
+	case routing.SendingQuery:
+		if verbose {
+			fmt.Fprintf(out, "* querying %s\n", obj.ID)
+		}
+	case routing.Value:
+		if verbose {
+			fmt.Fprintf(out, "got value: '%s'\n", obj.Extra)
+		} else {
+			fmt.Fprint(out, obj.Extra)
+		}
+	case routing.PeerResponse:
+		if verbose {
+			fmt.Fprintf(out, "* %s says use ", obj.ID)
+			for _, p := range obj.Responses {
+				fmt.Fprintf(out, "%s ", p.ID)
+			}
+			fmt.Fprintln(out)
+		}
+	case routing.QueryError:
+		if verbose {
+			fmt.Fprintf(out, "error: %s\n", obj.Extra)
+		}
+	case routing.DialingPeer:
+		if verbose {
+			fmt.Fprintf(out, "dialing peer: %s\n", obj.ID)
+		}
+	case routing.AddingPeer:
+		if verbose {
+			fmt.Fprintf(out, "adding peer to query: %s\n", obj.ID)
+		}
+	case routing.FinalPeer:
+	default:
+		if verbose {
+			fmt.Fprintf(out, "unrecognized event type: %d\n", obj.Type)
+		}
+	}
+	return nil
+}
+
+func escapeDhtKey(s string) (string, error) {
+	parts := path.SplitList(s)
+	if len(parts) != 3 ||
+		parts[0] != "" ||
+		!(parts[1] == "ipns" || parts[1] == "pk") {
+		return "", errors.New("invalid key")
+	}
+
+	k, err := peer.Decode(parts[2])
+	if err != nil {
+		return "", err
+	}
+	return path.Join(append(parts[:2], string(k))), nil
 }
